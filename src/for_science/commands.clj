@@ -17,10 +17,11 @@
             [sci.impl.utils               :as sciiu]
             [embroidery.api               :as e]
             [rencg.api                    :as re]
-            [discljord.formatting         :as df]
-            [discljord-utils.message-util :as mu]
-            [bot.commands                 :as cmd]
-            [bot.config                   :as cfg]))
+            [discljord.messaging          :as msg]
+            [slash.command                :as cmd]
+            [slash.command.structure      :as stc]
+            [slash.component.structure    :as cmps]
+            [for-science.components       :as cmp]))
 
 (def ^:private default-timeout-in-sec 2)
 (def ^:private maximum-output-length  512)
@@ -69,18 +70,18 @@
      (log/debug "Evaluating Clojure forms:" code)
      (let [result (try
                     (let [f           (e/future*
-                                        (try
-                                          (let [sw     (java.io.StringWriter.)
-                                                result (sci/binding [sci/out sw
-                                                                     sci/err sw]
-                                                         (truncate-string (pr-str (sci/eval-string* sci-ctx (str code-prefix "\n" code)))))]    ; Make sure we stringify the result inside sci/binding, to force de-lazying of the result of evaluating code
-                                            (merge {:result result}
-                                                   (when-let [output (when-not (s/blank? (str sw)) (truncate-string (str sw)))] {:output output})))
-                                          (catch Throwable t
-                                            {:error t})))
+                                       (try
+                                         (let [sw     (java.io.StringWriter.)
+                                               result (sci/binding [sci/out sw
+                                                                    sci/err sw]
+                                                        (truncate-string (pr-str (sci/eval-string* sci-ctx (str code-prefix "\n" code)))))]    ; Make sure we stringify the result inside sci/binding, to force de-lazying of the result of evaluating code
+                                           (merge {:result result}
+                                                  (when-let [output (when-not (s/blank? (str sw)) (truncate-string (str sw)))] {:output output})))
+                                         (catch Throwable t
+                                           {:error t})))
                           eval-result (deref f
-                                        (* 1000 timeout-in-sec)
-                                        {:error (str "Execution terminated after " timeout-in-sec "s.")})]
+                                             (* 1000 timeout-in-sec)
+                                             {:error (str "Execution terminated after " timeout-in-sec "s.")})]
                       (when-not (future-done? f) (future-cancel f))
                       eval-result)
                     (catch Throwable t
@@ -88,52 +89,117 @@
        (log/debug "Result:" result)
        result))))
 
-(defn ^{:bot-command "clj"} clj-command!
-  "Evaluates the body of the message as Clojure code, or, if the message contains clojure, clj, or unqualified code fences, combines and evaluates them (ignoring everything outside the code fences, thereby enabling 'literate' style messages)"
-  [args event-data]
-  (when-not (s/blank? args)
-    (let [channel-id   (:channel-id event-data)
-          clojure-code (s/trim
-                         (if-let [clojure-snippets (re/re-seq clojure-code-fence-regex args)]
-                           (s/join "\n" (filter #(not (s/blank? %)) (map #(get % "source") clojure-snippets)))
-                           args))
-          eval-result  (eval-clj clojure-code)
-          message      (if (:error eval-result)
-                         (str "```\n⚠️ " (:error eval-result) "\n```")
-                         (str (when (:output eval-result) (str "Output:\n```\n" (:output eval-result) "\n```\n"))
-                              "Result:\n```clojure\n" (:result eval-result) "\n```"))]
-      (mu/create-message! (:discord-message-channel cfg/config)
-                          channel-id
-                          :embed (assoc (cmd/embed-template)
-                                        :description message)))))
+(def ^:private embed-color 0x4e87e6)
+(def ^:private error-color 0xFF0000)
+(def ^:private ephemeral   64)   
 
-(defn ^{:bot-command "move"} move-command!
-  "Moves a conversation to the specified channel e.g. !move #memes"
-  [args event-data]
-  (when (not (mu/direct-message? event-data))   ; Only respond if the message was sent to a real channel in a server (i.e. not in a DM)
-    (let [guild-id                (:guild-id event-data)
-          channel-id              (:channel-id event-data)
-          discord-message-channel (:discord-message-channel cfg/config)]
-      (if (not (s/blank? args))
-        (if-let [target-channel-id (second (re-find df/channel-mention args))]
-          (if (not= channel-id target-channel-id)
-            (let [move-message-id    (:id event-data)
-                  _                  (mu/delete-message! discord-message-channel channel-id move-message-id)   ; Don't delete the original message unless we've validated everything
-                  target-message-id  (:id (mu/create-message! discord-message-channel
-                                                              target-channel-id
-                                                              :embed (assoc (cmd/embed-template)
-                                                                            :description (str "Continuing the conversation from " (mu/channel-link channel-id) "..."))))
-                  target-message-url (mu/message-url guild-id target-channel-id target-message-id)
-                  source-message-id  (:id (mu/create-message! discord-message-channel
-                                                              channel-id
-                                                              :embed (assoc (cmd/embed-template)
-                                                                            :description (str "Let's continue this conversation in " (mu/channel-link target-channel-id) " ([link](" target-message-url "))."))))
-                  source-message-url (mu/message-url guild-id channel-id source-message-id)]
-              (mu/edit-message! discord-message-channel
-                                target-channel-id
-                                target-message-id
-                                :embed (assoc (cmd/embed-template)
-                                              :description (str "Continuing the conversation from " (mu/channel-link channel-id)  " ([link](" source-message-url "))..."))))
-            (log/info "Cannot move a conversation to the same channel."))
-          (log/warn "Could not find target channel in move command."))
-        (log/warn "move-command! arguments missing a target channel.")))))
+(def ^:private logo-url "https://thumb.wikimedia.org/wikipedia/commons/thumb/5/5d/Clojure_logo.svg/250px-Clojure_logo.svg.png")
+
+(defn- embed-template
+  "Base for every embed we send: blue bar, footer with the bot's name and logo, and a timestamp."
+  []
+  {:color     embed-color
+   :footer    {:text "for-science" :icon_url logo-url}
+   :timestamp (str (java.time.Instant/now))})
+
+(def commands 
+  [(stc/command
+    "clj"
+    "Evaluates Clojure code"
+    :options
+    [(stc/option "code" "The Clojure code to evaluate" :string :required true)])
+   (stc/command
+    "move"
+    "Moves a conversation to the specified channel"
+    :options
+    [(stc/option "channel" "The channel to continue the conversation in" :channel
+                 :channel-types [:guild-text]
+                 :required true)])])
+
+(defn- extract 
+  [text]
+  (s/trim
+   (if-let [clojure-snippets (re/re-seq clojure-code-fence-regex text)]
+     (s/join "\n" (filter #(not (s/blank? %)) (map #(get % "source") clojure-snippets)))
+     text)))
+
+(defn- format-eval-result
+  [eval-result]
+  (if (:error eval-result)
+    (str "```\n⚠️ " (:error eval-result) "\n```")
+    (str (when (:output eval-result) (str "Output:\n```\n" (:output eval-result) "\n```\n"))
+         "Result:\n```clojure\n" (:result eval-result) "\n```")))
+
+(cmd/defhandler clj-command
+  ["clj"]
+  {:keys [id token]}
+  [code]
+  (let [conn     @cmp/connection
+        ; evaluation can take up to a couple of seconds, but discord requires an answer within 3s, so we send a
+        ; "thinking..." response and then edit it with the actual result
+        ; TODO: check if whats above is actually needed xd
+        response (msg/create-interaction-response! conn id token 5)]
+    (future
+      (try
+        (let [eval-result (eval-clj (extract code))]
+          @(msg/edit-original-interaction-response!
+            conn
+            cmp/application-id
+            token
+            :embeds [(assoc (embed-template) :description (format-eval-result eval-result))]))
+        (catch Throwable t
+          (log/error t "Failed to evaluate or respond to /clj"))))
+    response))
+
+(defn- message-url
+  [guild-id channel-id message-id]
+  (str "https://discord.com/channels/" guild-id "/" channel-id "/" message-id))
+
+(defn- channel-link
+  [channel-id]
+  (str "<#" channel-id ">"))
+
+(defn- reply-privately!
+  [conn id token text]
+  (msg/create-interaction-response!
+   conn id token 4
+   :data {:embeds [(assoc (embed-template) :description text :color error-color)]
+          :flags  ephemeral}))
+
+(cmd/defhandler move-command
+  ["move"]
+  {:keys [id token channel-id guild-id]}
+  [channel]
+  (let [conn @cmp/connection]
+    (cond
+      (nil? guild-id)
+      (reply-privately! conn id token "This command can only be used in a server channel.")
+
+      (= channel channel-id)
+      (reply-privately! conn id token "Can't move the conversation to the same channel.")
+
+      :else
+      (let [target-message-id  (:id @(msg/create-message!
+                                      conn channel
+                                      :embed (assoc (embed-template)
+                                                    :description (str "Continuing the conversation from " (channel-link channel-id) "..."))))
+            target-message-url (message-url guild-id channel target-message-id)
+            response           (msg/create-interaction-response!
+                                conn id token 4
+                                :data {:embeds     [(assoc (embed-template)
+                                                           :description (str "Let's continue this conversation in " (channel-link channel) " ([link](" target-message-url "))"))]
+                                       :components [(cmps/action-row
+                                                     (cmps/link-button target-message-url :label "Link"))]}) 
+            source-message-id  (:id @(msg/get-original-interaction-response! conn cmp/application-id token))
+            source-message-url (message-url guild-id channel-id source-message-id)]
+        @(msg/edit-message!
+          conn channel target-message-id
+          :embed (assoc (embed-template)
+                        :description (str "Continuing the conversation from " (channel-link channel-id) " ([link](" source-message-url "))..."))
+          :components [(cmps/action-row
+                        (cmps/link-button source-message-url :label "Link"))])
+        response))))
+
+(cmd/defpaths command-paths
+  clj-command
+  move-command)

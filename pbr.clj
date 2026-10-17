@@ -15,7 +15,7 @@
          :version          (format "1.0.%s" (.format (java.text.SimpleDateFormat. "yyyyMMdd") (java.util.Date.)))
          :prod-branch      "release"
          :uber-file        "./target/for-science-standalone.jar"
-         :main             'bot.main
+         :main             'for-science.core
          :deploy-info-file "./resources/build-info.edn"
          :write-pom        true
          :pom {:description      "A small Discord bot that you can send Clojure code to, to experiment with the language, demonstrate core language principles, or just mess about."
