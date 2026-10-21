@@ -15,13 +15,15 @@
             [clojure.tools.logging        :as log]
             [sci.core                     :as sci]
             [sci.impl.utils               :as sciiu]
-            [embroidery.api               :as e]
-            [rencg.api                    :as re]
-            [discljord.messaging          :as msg]
-            [slash.command                :as cmd]
+            [slash.command                :as slash-cmd]
             [slash.command.structure      :as stc]
             [slash.component.structure    :as cmps]
-            [for-science.components       :as cmp]))
+            [embroidery.api               :as e]
+            [rencg.api                    :as re]
+            [discljord-utils.util         :as u]
+            [discljord-utils.message-util :as mu]
+            [bot.commands                 :as cmd]
+            [bot.config                   :as cfg]))
 
 (def ^:private default-timeout-in-sec 2)
 (def ^:private maximum-output-length  512)
@@ -70,18 +72,18 @@
      (log/debug "Evaluating Clojure forms:" code)
      (let [result (try
                     (let [f           (e/future*
-                                       (try
-                                         (let [sw     (java.io.StringWriter.)
-                                               result (sci/binding [sci/out sw
-                                                                    sci/err sw]
-                                                        (truncate-string (pr-str (sci/eval-string* sci-ctx (str code-prefix "\n" code)))))]    ; Make sure we stringify the result inside sci/binding, to force de-lazying of the result of evaluating code
-                                           (merge {:result result}
-                                                  (when-let [output (when-not (s/blank? (str sw)) (truncate-string (str sw)))] {:output output})))
-                                         (catch Throwable t
-                                           {:error t})))
+                                        (try
+                                          (let [sw     (java.io.StringWriter.)
+                                                result (sci/binding [sci/out sw
+                                                                     sci/err sw]
+                                                         (truncate-string (pr-str (sci/eval-string* sci-ctx (str code-prefix "\n" code)))))]    ; Make sure we stringify the result inside sci/binding, to force de-lazying of the result of evaluating code
+                                            (merge {:result result}
+                                                   (when-let [output (when-not (s/blank? (str sw)) (truncate-string (str sw)))] {:output output})))
+                                          (catch Throwable t
+                                            {:error t})))
                           eval-result (deref f
-                                             (* 1000 timeout-in-sec)
-                                             {:error (str "Execution terminated after " timeout-in-sec "s.")})]
+                                        (* 1000 timeout-in-sec)
+                                        {:error (str "Execution terminated after " timeout-in-sec "s.")})]
                       (when-not (future-done? f) (future-cancel f))
                       eval-result)
                     (catch Throwable t
@@ -89,39 +91,16 @@
        (log/debug "Result:" result)
        result))))
 
-(def ^:private embed-color 0x4e87e6)
-(def ^:private error-color 0xFF0000)
-(def ^:private ephemeral   64)   
+(def ^:private max-displayed-code-length 1000)
+(def ^:private ephemeral-flag               64)   ; Discord message flag: only visible to the user who invoked the command
 
-(def ^:private logo-url "https://thumb.wikimedia.org/wikipedia/commons/thumb/5/5d/Clojure_logo.svg/250px-Clojure_logo.svg.png")
-
-(defn- embed-template
-  "Base for every embed we send: blue bar, footer with the bot's name and logo, and a timestamp."
-  []
-  {:color     embed-color
-   :footer    {:text "for-science" :icon_url logo-url}
-   :timestamp (str (java.time.Instant/now))})
-
-(def commands 
-  [(stc/command
-    "clj"
-    "Evaluates Clojure code"
-    :options
-    [(stc/option "code" "The Clojure code to evaluate" :string :required true)])
-   (stc/command
-    "move"
-    "Moves a conversation to the specified channel"
-    :options
-    [(stc/option "channel" "The channel to continue the conversation in" :channel
-                 :channel-types [:guild-text]
-                 :required true)])])
-
-(defn- extract 
+(defn- extract-code
+  "Extracts the Clojure code from `text`: if it contains clojure, clj or unqualified code fences, combines their contents (ignoring everything outside the fences, thereby enabling 'literate' style messages), otherwise returns `text` as is."
   [text]
   (s/trim
-   (if-let [clojure-snippets (re/re-seq clojure-code-fence-regex text)]
-     (s/join "\n" (filter #(not (s/blank? %)) (map #(get % "source") clojure-snippets)))
-     text)))
+    (if-let [clojure-snippets (re/re-seq clojure-code-fence-regex text)]
+      (s/join "\n" (filter #(not (s/blank? %)) (map #(get % "source") clojure-snippets)))
+      text)))
 
 (defn- format-eval-result
   [eval-result]
@@ -130,76 +109,111 @@
     (str (when (:output eval-result) (str "Output:\n```\n" (:output eval-result) "\n```\n"))
          "Result:\n```clojure\n" (:result eval-result) "\n```")))
 
-(cmd/defhandler clj-command
+(defn- truncate
+  [s max-length]
+  (if (> (count s) max-length)
+    (str (subs s 0 max-length) "…")
+    s))
+
+(defn ^{:bot-command "clj"} clj-command!
+  "Evaluates the body of the message as Clojure code, or, if the message contains clojure, clj, or unqualified code fences, combines and evaluates them (ignoring everything outside the code fences, thereby enabling 'literate' style messages)"
+  [args event-data]
+  (when-not (s/blank? args)
+    (mu/create-message! (:discord-message-channel cfg/config)
+                        (:channel-id event-data)
+                        :embed (assoc (cmd/embed-template)
+                                      :description (format-eval-result (eval-clj (extract-code args)))))))
+
+(def slash-commands
+  [(stc/command "clj"
+                "Evaluates Clojure code"
+                :options [(stc/option "code" "The Clojure code to evaluate" :string :required true)])
+   (stc/command "move"
+                "Moves a conversation to the specified channel"
+                :options [(stc/option "channel" "The channel to continue the conversation in" :channel
+                                      :channel-types [:guild-text]
+                                      :required true)])])
+
+(defn- reply-privately!
+  "Replies to the interaction with a message that only the invoking user can see."
+  [interaction-id interaction-token text]
+  (mu/create-interaction-response! (:discord-message-channel cfg/config)
+                                   interaction-id
+                                   interaction-token
+                                   4
+                                   :data {:embeds [(assoc (cmd/embed-template) :description text)]
+                                          :flags  ephemeral-flag}))
+
+(defn- fail-privately!
+  "Replaces the response with a message that only the invoking user can see, telling them that something went wrong."
+  [interaction-token]
+  (try
+    (let [discord-message-channel (:discord-message-channel cfg/config)
+          application-id          (:discord-application-id cfg/config)]
+      (mu/delete-original-interaction-response! discord-message-channel application-id interaction-token)
+      (mu/create-followup-message! discord-message-channel
+                                   application-id
+                                   interaction-token
+                                   :embeds [(assoc (cmd/embed-template) :description "⚠️ Something went wrong while processing your command. Please try again later.")]
+                                   :flags  ephemeral-flag))
+    (catch Exception e
+      (u/log-exception e))))
+
+(slash-cmd/defhandler clj-slash-command
   ["clj"]
   {:keys [id token]}
   [code]
-  (let [conn     @cmp/connection
-        ; evaluation can take up to a couple of seconds, but discord requires an answer within 3s, so we send a
-        ; "thinking..." response and then edit it with the actual result
-        ; TODO: check if whats above is actually needed xd
-        response (msg/create-interaction-response! conn id token 5)]
-    (future
+  (let [discord-message-channel (:discord-message-channel cfg/config)]
+    ; evaluation can take a couple of seconds but discord requires an answer within 3 seconds, so send a thinking... response and edit it afterwards
+    (mu/create-interaction-response! discord-message-channel id token 5)
+    (e/future*
       (try
-        (let [eval-result (eval-clj (extract code))]
-          @(msg/edit-original-interaction-response!
-            conn
-            cmp/application-id
-            token
-            :embeds [(assoc (embed-template) :description (format-eval-result eval-result))]))
-        (catch Throwable t
-          (log/error t "Failed to evaluate or respond to /clj"))))
-    response))
+        (mu/edit-original-interaction-response!
+          discord-message-channel
+          (:discord-application-id cfg/config)
+          token
+          :embeds [(assoc (cmd/embed-template) 
+                          :description (str "Code:\n```clojure\n" (truncate code max-displayed-code-length) "\n```\n"
+                                            (format-eval-result (eval-clj (extract-code code)))))])
+        (catch Exception e
+          (u/log-exception e)
+          (fail-privately! token))))))
 
-(defn- message-url
-  [guild-id channel-id message-id]
-  (str "https://discord.com/channels/" guild-id "/" channel-id "/" message-id))
-
-(defn- channel-link
-  [channel-id]
-  (str "<#" channel-id ">"))
-
-(defn- reply-privately!
-  [conn id token text]
-  (msg/create-interaction-response!
-   conn id token 4
-   :data {:embeds [(assoc (embed-template) :description text :color error-color)]
-          :flags  ephemeral}))
-
-(cmd/defhandler move-command
+(slash-cmd/defhandler move-slash-command
   ["move"]
   {:keys [id token channel-id guild-id]}
   [channel]
-  (let [conn @cmp/connection]
-    (cond
-      (nil? guild-id)
-      (reply-privately! conn id token "This command can only be used in a server channel.")
+  (cond
+    (nil? guild-id)        (reply-privately! id token "This command can only be used in a server channel.")
+    (= channel channel-id) (reply-privately! id token "Can't move the conversation to the same channel.")
+    :else
+    (let [discord-message-channel (:discord-message-channel cfg/config)
+          application-id          (:discord-application-id cfg/config)]
+      (mu/create-interaction-response! discord-message-channel id token 5)
+      (try
+        (let [target-message-id  (:id (mu/create-message! discord-message-channel
+                                                          channel
+                                                          :embed (assoc (cmd/embed-template)
+                                                                        :description (str "Continuing the conversation from " (mu/channel-link channel-id) "..."))))
+              target-message-url (mu/message-url guild-id channel target-message-id)
+              source-message-id  (:id (mu/edit-original-interaction-response!
+                                        discord-message-channel
+                                        application-id
+                                        token
+                                        :embeds     [(assoc (cmd/embed-template)
+                                                            :description (str "Let's continue this conversation in " (mu/channel-link channel) " ([link](" target-message-url "))."))]
+                                        :components [(cmps/action-row (cmps/link-button target-message-url :label "Link"))]))
+              source-message-url (mu/message-url guild-id channel-id source-message-id)]
+          (mu/edit-message! discord-message-channel
+                            channel
+                            target-message-id
+                            :embed      (assoc (cmd/embed-template)
+                                               :description (str "Continuing the conversation from " (mu/channel-link channel-id) " ([link](" source-message-url "))..."))
+                            :components [(cmps/action-row (cmps/link-button source-message-url :label "Link"))]))
+        (catch Exception e
+          (u/log-exception e)
+          (fail-privately! token))))))
 
-      (= channel channel-id)
-      (reply-privately! conn id token "Can't move the conversation to the same channel.")
-
-      :else
-      (let [target-message-id  (:id @(msg/create-message!
-                                      conn channel
-                                      :embed (assoc (embed-template)
-                                                    :description (str "Continuing the conversation from " (channel-link channel-id) "..."))))
-            target-message-url (message-url guild-id channel target-message-id)
-            response           (msg/create-interaction-response!
-                                conn id token 4
-                                :data {:embeds     [(assoc (embed-template)
-                                                           :description (str "Let's continue this conversation in " (channel-link channel) " ([link](" target-message-url "))"))]
-                                       :components [(cmps/action-row
-                                                     (cmps/link-button target-message-url :label "Link"))]}) 
-            source-message-id  (:id @(msg/get-original-interaction-response! conn cmp/application-id token))
-            source-message-url (message-url guild-id channel-id source-message-id)]
-        @(msg/edit-message!
-          conn channel target-message-id
-          :embed (assoc (embed-template)
-                        :description (str "Continuing the conversation from " (channel-link channel-id) " ([link](" source-message-url "))..."))
-          :components [(cmps/action-row
-                        (cmps/link-button source-message-url :label "Link"))])
-        response))))
-
-(cmd/defpaths command-paths
-  clj-command
-  move-command)
+(slash-cmd/defpaths slash-command-paths
+  clj-slash-command
+  move-slash-command)

@@ -11,14 +11,12 @@
 {:paths ["src" "resources"]
  :deps
    {org.clojure/clojure               {:mvn/version "1.12.6"}
-    org.babashka/sci                  {:mvn/version "0.15.58"}
+    org.babashka/sci                  {:mvn/version "0.15.59"}
     com.github.pmonks/rencg           {:mvn/version "1.0.90"}
-    com.github.pmonks/discljord-utils {:mvn/version "1.0.137"}
-    com.github.discljord/discljord    {:mvn/version "1.3.1"}
-    com.github.johnnyjayjay/slash     {:mvn/version "0.3.0-SNAPSHOT"}}
+    com.github.pmonks/discljord-utils {:mvn/version "1.0.137"}}
  :aliases
    {:build {:deps       {com.github.pmonks/pbr {:mvn/version "RELEASE"}}
             :ns-default pbr.build}
 
-    ; DISCORD_API_TOKEN=... APPLICATION_ID=... clj -M:main
-    :main  {:main-opts ["-m" "for-science.core"]}}}
+    ; clj -M:main -c /path/to/config.edn
+    :main  {:main-opts ["-m" "bot.main"]}}}
